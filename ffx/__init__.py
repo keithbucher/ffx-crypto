@@ -1,0 +1,346 @@
+"""
+Module that implements FFX encryption as specified in NIST draft SP800-38G
+"""
+
+import string
+import math
+import binascii
+import functools
+
+import gmpy2
+from gmpy2 import mpfr
+from gmpy2 import mpz
+
+from Crypto.Cipher import AES
+from Crypto.Util import Counter
+from builtins import int
+from binascii import unhexlify, hexlify
+
+# Credit to Tripp Lilley from StackOverflow for this function,
+# modified to pad if necessary and handle zero values properly
+def long_to_bytes (val, iBlocksize=1, endianness='big'):
+    """
+    Use :ref:`string formatting` and :func:`~binascii.unhexlify` to
+    convert ``val``, a :func:`long`, to a byte :func:`str`.
+
+    :param long val: The value to pack
+
+    :param int iBlockSize: If specified, output will be right-justified and padded with zeroes
+
+    :param str endianness: The endianness of the result. ``'big'`` for
+      big-endian, ``'little'`` for little-endian.
+
+    If you want byte- and word-ordering to differ, you're on your own.
+
+    Using :ref:`string formatting` lets us use Python's C innards.
+    """
+
+    # one (1) hex digit per four (4) bits
+    width = val.bit_length()
+
+    # Account for zero values
+    if(width == 0): width = 8
+
+    # unhexlify wants an even multiple of eight (8) bits, but we don't
+    # want more digits than we need (hence the ternary-ish 'or')
+    width += 8 - ((width % 8) or 8)
+
+    # format width specifier: four (4) bits per hex digit
+    fmt = '%%0%dx' % (width // 4)
+
+    # prepend zero (0) to the width, to zero-pad the output
+    s = bytearray(unhexlify(fmt % val))
+
+    if endianness == 'little':
+        # see http://stackoverflow.com/a/931095/309233
+        s = s[::-1]
+
+    # Pad output if necessary
+    sPad = bytearray()
+    if(iBlocksize > 1 and ((len(s) % iBlocksize) != 0)):
+        sPad = bytearray(b'\x00' * (iBlocksize - (len(s) % iBlocksize)) )
+
+    sPad.extend(s)
+
+    return sPad
+
+def bytes_to_long(bytestring):
+    """Given a ``bytestring`` returns its integer representation ``N``.
+    """
+
+    N = binascii.hexlify(bytestring)
+    N = mpz(N, 16)
+
+    return N
+
+
+class UnsupportedTypeException(Exception):
+    """
+    Unsupported type used in function
+    """
+    pass
+
+class InvalidRadixException(Exception):
+    """
+    Invalid radix values passed, can occur when trying to combine FFXStrings with different radix
+    """
+    pass
+
+class FFXString(object):
+    """
+    Represents a character string that FFX will operate on
+    """
+    def __init__(self, sInit, iRadix=10, iBlockSize=128):
+        """
+        Construct a new FFX character string
+
+        :param    sInit        The value of the character string, can be int, str or FFXString
+        :param    iRadix        The radix of the character string alphabet, default 10 for integers
+        :param    iBlockSize    The blocksize to use with the character string in bits, default 128 bits
+        :return    returns nothing
+        """
+
+        # Determine the type of the initial value
+        if(isinstance(sInit, int)):
+            self._sValue = mpz(sInit).digits(iRadix)
+        elif(isinstance(sInit, str)):
+            self._sValue = sInit
+        elif(isinstance(sInit, FFXString)):
+            self._sValue = sInit._sValue
+        elif(isinstance(sInit, bytearray)):
+            self._sValue = mpz(bytes_to_long(sInit)).digits(iRadix)
+        else:
+            raise UnsupportedTypeException(type(sInit))
+
+        self._iRadix = iRadix
+        self._iBlockSize = iBlockSize
+        self._iLen = len(self._sValue)
+
+        # Representations of value as integer and bytearray
+        self._iValue = None
+        self._bValue = None
+
+    def __add__(self, other):
+        retval = self._sValue
+        if isinstance(other, FFXString):
+            if(self._iRadix != other._iRadix):
+                raise InvalidRadixException
+            retval += other._sValue
+        return retval
+
+
+    def __getitem__( self, key ) :
+        if isinstance( key, slice ) :
+            #Get the start, stop, and step from the slice
+            retval = ''
+            for ii in range(*key.indices(len(self))):
+                retval += self._sValue[ii]
+            return FFXString(retval, self._iRadix, self._iBlockSize)
+            #return [self[ii] for ii in range(*key.indices(len(self)))]
+        elif isinstance( key, int ) :
+            if key < 0 : #Handle negative indices
+                key += len( self )
+            if key >= len( self ) :
+                raise IndexError
+            return self._sValue[key]
+        else:
+            raise TypeError
+
+    def __len__(self):
+        if self._iLen == None:
+            self._iLen = len(self._sValue)
+        return self._iLen
+
+    def __str__(self):
+        return self._sValue
+
+    def getMid(self):
+        """
+        Return the middle index to use when splitting the string
+        """
+        return int(math.floor((self._iLen * 1.0) / 2))
+
+    def to_int(self):
+        if not self._iValue:
+            self._iValue = int(self._sValue, self._iRadix)
+        return self._iValue
+
+    def to_bytes(self, iBlocksize=1):
+        """
+        Return bytearray that represents big-endian encoded integer value of _sValue
+        """
+        #if not self._bValue:
+        self._bValue = long_to_bytes(self.to_int(), iBlocksize=iBlocksize)
+        return self._bValue
+
+
+
+
+class FFXCrypt(object):
+    """
+    Class that handles FFX cryptographic operations on FFX character strings
+    """
+    def __init__(self, ffxKey, iRadix=10, iBlockSize=128):
+        """
+        Contruct a new FFX cryptographic object
+
+        :param    ffxKey          The key to use in cryptographic operations, should be FFXstring object
+        :param    iRadix        The radix of the character sting alphabet, default 10 for integers
+        :param    iBlockSize    The blocksize to use with the character string in bits, default 128 bits
+        """
+
+        self._ffxKey = None
+
+        self._iRadix = iRadix
+        self._iBlockSize = iBlockSize
+        if(isinstance(ffxKey, FFXString)):
+            self._ffxKey = ffxKey
+        else:
+            raise UnsupportedTypeException(type(ffxKey))
+
+    def encrypt(self, sData, sTweak=None):
+        """
+        Encrypt data
+
+        :param    sTweak    The tweak to use
+        :param    sData     The data to encrypt
+        """
+        # TODO: type checking
+
+        # Note, used variable notation from NIST 800-38g draft
+
+        # Set rounds
+        if(sTweak != None):
+            t = len(sTweak)
+        else:
+            t = 0
+        # Number of rounds to run
+        iRnds = 10
+
+        # Split data into substrings, FF1 steps 1 & 2
+        n = len(sData)
+        u = sData.getMid()
+        v = n-u
+
+
+        A = sData[:u]
+        B = sData[u:]
+
+        #print("A = " + str(A))
+        #print("B = " + str(B))
+
+        #print("A+B = " + str(A + B))
+
+        # Calculate byte lengths, FF1 step 3
+        b = math.ceil(math.ceil(v*math.log(self._iRadix, 2))/8.0)
+        d = 4*math.ceil(b/4)+4
+
+        # Calculate initial block P, FF1 step 4
+        P = bytearray(b"\x01\x02\x01")
+        P.extend( long_to_bytes(self._iRadix, iBlocksize=3))
+        P.extend(b"\x0a")
+        P.extend( long_to_bytes(u % 256))
+        P.extend( long_to_bytes(n, iBlocksize=4))
+        P.extend( long_to_bytes(t, iBlocksize=4))
+
+        # Execute Feistel rounds, FF1 step 5
+        for i in range(iRnds):
+            Q = bytearray(b'')
+            # FF1 5.i
+            if(sTweak != None):
+                Q.extend(str(sTweak).encode())
+            Q.extend(b'\x00' * ((-t-b-1) % 16))
+            Q.extend(long_to_bytes(i))
+            Q.extend(B.to_bytes(b))
+
+            # FF1 5.ii
+            bKey = bytes(self._ffxKey.to_bytes(16))
+            #bKey = bytes(b'\x00'*16)
+            #print(binascii.hexlify(bKey))
+            #print(len(self._ffxKey.to_bytes(16)))
+            cbcAES = AES.new(bKey, AES.MODE_CBC, '\x00' * AES.block_size)
+            sPlainText = bytearray()
+            sPlainText.extend(P)
+            sPlainText.extend(Q)
+            R = cbcAES.encrypt(bytes(sPlainText))[-16:]
+
+            # FF1 5.iii
+            ebcAES = AES.new(bKey, AES.MODE_ECB)
+            sTmp = bytearray(R)
+            for j in range(1, math.ceil(d/16.0)):
+                sBlockPlaintext = bytearray(R[x] ^ j.to_bytes(16) for x in range(16))
+                sBlock = ebcAES.encrypt(sBlockPlaintext)
+                sTmp.extend(sBlock)
+
+            S = bytearray(R[:d])
+
+            # FF1 5.iv
+            y = FFXString(S, iRadix=2).to_int()
+
+            # FF1 5.v
+            if( i % 2 == 0):
+                m = u
+            else:
+                m = v
+
+            # FF1 5.vi
+            c = (A.to_int() + y) % (self._iRadix ** m)
+            # FF1 5.vii
+            strTmp = str(FFXString(c, iRadix=self._iRadix))
+            C = FFXString(strTmp[:m], iRadix=self._iRadix)
+
+            # FF1 5.viii
+            A = B
+
+            # FF1 5.ix
+            B = C
+
+        # FF1 6
+        sRetValue = str(A) + str(B)
+        return(sRetValue)
+
+
+"""
+            print("Q = ")
+            print(binascii.hexlify(Q))
+            print("B = ")
+            print(binascii.hexlify(B.to_bytes()))
+            print("sTweak = ")
+            print(binascii.hexlify(sTweak.to_bytes()))
+
+
+
+
+        print("Q = ")
+        print(binascii.hexlify(Q))
+        #print("P = " + binascii.hexlify(P))
+        print("P = ")
+        print(binascii.hexlify(P))
+"""
+
+
+# Start test code
+#sData = FFXString('123456789')
+bKey = bytearray(unhexlify('2b7e151628aed2a6abf7158809cf4f3c'))
+
+sKey = FFXString(bKey)
+
+iRadix = 10
+sData = FFXString('0123456789', iRadix=iRadix)
+sTweak = FFXString('9876543210', iRadix=iRadix)
+#sTweak = None
+
+"""
+bVal = FFXString('78728').to_bytes(3)
+print("bVal = ")
+print(hexlify(bVal))
+lVal = bytes_to_long(bVal)
+print(lVal)
+"""
+
+sCrypt = FFXCrypt(sKey).encrypt(sData, sTweak)
+print("sCrypt = " + sCrypt)
+
+
+
+
