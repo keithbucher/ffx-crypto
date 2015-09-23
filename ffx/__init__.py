@@ -16,6 +16,9 @@ from Crypto.Util import Counter
 from builtins import int
 from binascii import unhexlify, hexlify
 
+from abc import ABCMeta, abstractmethod
+from test.pickletester import metaclass
+
 # Credit to Tripp Lilley from StackOverflow for this function,
 # modified to pad if necessary and handle zero values properly
 def long_to_bytes (val, iBlocksize=1, endianness='big'):
@@ -171,18 +174,33 @@ class FFXString(object):
         """
         #if not self._bValue:
         self._bValue = long_to_bytes(self.to_int(), iBlocksize=iBlocksize)
-        return self._bValue
+        return(self._bValue)
 
 
-
-
-class FFXCrypt(object):
+class FFXMode(metaclass=ABCMeta):
     """
-    Class that handles FFX cryptographic operations on FFX character strings
+    Abstract Class that represents FFX cryptographic modes
     """
+
+    _iRnds = 0
+
+    @abstractmethod
+    def encrypt(self, sData, sTweak=None):
+        pass
+
+    @abstractmethod
+    def decrypt(self, sData, sTweak=None):
+        pass
+
+    @abstractmethod
+    def crypt(self, iDirection, sData, sTweak=None):
+        pass
+
+class FFXModeFF1(FFXMode):
+
     def __init__(self, ffxKey, iRadix=10, iBlockSize=128):
         """
-        Contruct a new FFX cryptographic object
+        Contruct a new FFX FF1 mode cryptographic object
 
         :param    ffxKey          The key to use in cryptographic operations, should be FFXstring object
         :param    iRadix        The radix of the character sting alphabet, default 10 for integers
@@ -198,6 +216,19 @@ class FFXCrypt(object):
         else:
             raise UnsupportedTypeException(type(ffxKey))
 
+        self._iRnds = 10
+
+    def decrypt(self, sData, sTweak=None):
+        """
+        Encrypt data
+
+        :param    sTweak    The tweak to use
+        :param    sData     The data to encrypt
+        """
+
+        # Call crypt function with encryption direction
+        return(self.crypt(FFXCrypt.FFX_DECRYPT, sData, sTweak))
+
     def encrypt(self, sData, sTweak=None):
         """
         Encrypt data
@@ -205,6 +236,11 @@ class FFXCrypt(object):
         :param    sTweak    The tweak to use
         :param    sData     The data to encrypt
         """
+
+        # Call crypt function with encryption direction
+        return(self.crypt(FFXCrypt.FFX_ENCRYPT, sData, sTweak))
+
+    def crypt(self, iDirection, sData, sTweak=None):
         # TODO: type checking
 
         # Note, used variable notation from NIST 800-38g draft
@@ -214,8 +250,6 @@ class FFXCrypt(object):
             t = len(sTweak)
         else:
             t = 0
-        # Number of rounds to run
-        iRnds = 10
 
         # Split data into substrings, FF1 steps 1 & 2
         n = len(sData)
@@ -244,7 +278,16 @@ class FFXCrypt(object):
         P.extend( long_to_bytes(t, iBlocksize=4))
 
         # Execute Feistel rounds, FF1 step 5
-        for i in range(iRnds):
+        if(iDirection == FFXCrypt.FFX_ENCRYPT):
+            iStart = 0
+            iEnd = self._iRnds
+            iMult = 1
+        elif(iDirection == FFXCrypt.FFX_DECRYPT):
+            iStart = self._iRnds
+            iEnd = 0
+            iMult = -1
+
+        for i in range(iStart, iEnd):
             Q = bytearray(b'')
             # FF1 5.i
             if(sTweak != None):
@@ -284,7 +327,7 @@ class FFXCrypt(object):
                 m = v
 
             # FF1 5.vi
-            c = (A.to_int() + y) % (self._iRadix ** m)
+            c = (A.to_int() + iMult*y) % (self._iRadix ** m)
             # FF1 5.vii
             strTmp = str(FFXString(c, iRadix=self._iRadix))
             C = FFXString(strTmp[:m], iRadix=self._iRadix)
@@ -296,27 +339,72 @@ class FFXCrypt(object):
             B = C
 
         # FF1 6
-        sRetValue = str(A) + str(B)
+        sRetValue = str(A).rjust(u, '0') + str(B).rjust(v, '0')
         return(sRetValue)
 
+class FFXCrypt(object):
+    """
+    Class that handles FFX cryptographic operations on FFX character strings
+    """
 
-"""
-            print("Q = ")
-            print(binascii.hexlify(Q))
-            print("B = ")
-            print(binascii.hexlify(B.to_bytes()))
-            print("sTweak = ")
-            print(binascii.hexlify(sTweak.to_bytes()))
+    FFX_ENCRYPT = 1
+    FFX_DECRYPT = 2
+
+    MODE_FF1 = 1
+    MODE_FF2 = 2
+    MODE_FF3 = 3
+
+    def __init__(self, ffxKey, iMode=MODE_FF1, iRadix=10, iBlockSize=128):
+        """
+        Contruct a new FFX cryptographic object
+
+        :param    ffxKey          The key to use in cryptographic operations, should be FFXstring object
+        :param    iMode         The FFX mode to use, options are MODE_FF1 (default), MODE_FF2, MODE_FF3
+        :param    iRadix        The radix of the character sting alphabet, default 10 for integers
+        :param    iBlockSize    The blocksize to use with the character string in bits, default 128 bits
+        """
+
+        self._ffxKey = None
+
+        self._iRadix = iRadix
+        self._iBlockSize = iBlockSize
+        if(isinstance(ffxKey, FFXString)):
+            self._ffxKey = ffxKey
+        else:
+            raise UnsupportedTypeException(type(ffxKey))
+
+        if(iMode == self.MODE_FF1):
+            self._objMode = FFXModeFF1(ffxKey, iRadix, iBlockSize)
+
+
+    def decrypt(self, sData, sTweak=None):
+        """
+        Encrypt data
+
+        :param    sTweak    The tweak to use
+        :param    sData     The data to encrypt
+        """
+
+        # Call crypt function with encryption direction
+        return(self._objMode.crypt(self.FFX_DECRYPT, sData, sTweak))
+
+    def encrypt(self, sData, sTweak=None):
+        """
+        Encrypt data
+
+        :param    sTweak    The tweak to use
+        :param    sData     The data to encrypt
+        """
+
+        # Call crypt function with encryption direction
+        return(self._objMode.crypt(self.FFX_ENCRYPT, sData, sTweak))
+
+    def _crypt(self, iDirection, sData, sTweak=None):
+        # Call crypt function with encryption direction
+        return(self._objMode.crypt(iDirection, sData, sTweak))
 
 
 
-
-        print("Q = ")
-        print(binascii.hexlify(Q))
-        #print("P = " + binascii.hexlify(P))
-        print("P = ")
-        print(binascii.hexlify(P))
-"""
 
 
 # Start test code
@@ -340,6 +428,9 @@ print(lVal)
 
 sCrypt = FFXCrypt(sKey).encrypt(sData, sTweak)
 print("sCrypt = " + sCrypt)
+
+sPlain = FFXCrypt(sKey).decrypt(sData, sTweak)
+print("sPlain = " + sPlain)
 
 
 
