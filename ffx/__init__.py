@@ -90,6 +90,13 @@ class InvalidRadixException(Exception):
     """
     pass
 
+class InvalidTweakLengthException(Exception):
+    """
+    Invalid length for tweak specified.  For FFX mode FF3, the tweak must be exactly 64 characters long.
+    """
+    pass
+
+
 class InvalidFFXModeException(Exception):
     """
     Invalid FFX mode specified.  Valid modes are FFXCrypt.MODE_FF1, FFXCrypt.MODE_FF2, FFXCrypt.MODE_FF3
@@ -165,11 +172,16 @@ class FFXString(object):
     def __str__(self):
         return self._sValue
 
-    def getMid(self):
+    def getMid(self, iMode):
         """
         Return the middle index to use when splitting the string
         """
-        return int(math.floor((self._iLen * 1.0) / 2))
+        if(iMode == FFXCrypt.MODE_FF3):
+            retval = int(math.ceil((self._iLen * 1.0) / 2))
+        else:
+            retval = int(math.floor((self._iLen * 1.0) / 2))
+
+        return retval
 
     def to_int(self):
         if not self._iValue:
@@ -261,7 +273,7 @@ class FFXModeFF1(FFXMode):
 
         # Split data into substrings, FF1 steps 1 & 2
         n = len(sData)
-        u = sData.getMid()
+        u = sData.getMid(FFXCrypt.MODE_FF1)
         v = n-u
 
 
@@ -319,7 +331,7 @@ class FFXModeFF1(FFXMode):
             ebcAES = AES.new(bKey, AES.MODE_ECB)
             sTmp = bytearray(R)
             for j in range(1, math.ceil(d/16.0)):
-                sBlockPlaintext = bytearray(R[x] ^ j.to_bytes(16) for x in range(16))
+                sBlockPlaintext = bytearray(R[x] ^ j.to_bytes(16)[x] for x in range(16))
                 sBlock = ebcAES.encrypt(sBlockPlaintext)
                 sTmp.extend(sBlock)
 
@@ -407,7 +419,7 @@ class FFXModeFF2(FFXMode):
 
         # Split data into substrings, FF2 steps 1 & 2
         n = len(sData)
-        u = sData.getMid()
+        u = sData.getMid(FFXCrypt.MODE_FF2)
         v = n-u
 
 
@@ -488,6 +500,141 @@ class FFXModeFF2(FFXMode):
         sRetValue = str(A).rjust(u, '0') + str(B).rjust(v, '0')
         return(sRetValue)
 
+class FFXModeFF3(FFXMode):
+
+    def __init__(self, ffxKey, iRadix=10, iBlockSize=128):
+        """
+        Contruct a new FFX FF2 mode cryptographic object
+
+        :param    ffxKey          The key to use in cryptographic operations, should be FFXstring object
+        :param    iRadix        The radix of the character sting alphabet, default 10 for integers
+        :param    iBlockSize    The blocksize to use with the character string in bits, default 128 bits
+        """
+
+        self._ffxKey = None
+
+        self._iRadix = iRadix
+        self._iBlockSize = iBlockSize
+        if(isinstance(ffxKey, FFXString)):
+            self._ffxKey = ffxKey
+        else:
+            raise UnsupportedTypeException(type(ffxKey))
+
+        self._iRnds = 8
+
+    def decrypt(self, sData, sTweak=None):
+        """
+        Encrypt data
+
+        :param    sTweak    The tweak to use
+        :param    sData     The data to encrypt
+        """
+
+        # Call crypt function with encryption direction
+        return(self.crypt(FFXCrypt.FFX_DECRYPT, sData, sTweak))
+
+    def encrypt(self, sData, sTweak=None):
+        """
+        Encrypt data
+
+        :param    sTweak    The tweak to use
+        :param    sData     The data to encrypt
+        """
+
+        # Call crypt function with encryption direction
+        return(self.crypt(FFXCrypt.FFX_ENCRYPT, sData, sTweak))
+
+    def crypt(self, iDirection, sData, sTweak=None):
+        # TODO: type checking
+
+        # Note, used variable notation from NIST 800-38g draft
+
+        # Set rounds
+        if(sTweak != None):
+            t = len(sTweak)
+            # FF3 requires 64 bit tweak
+            if(t != 8):
+                raise InvalidTweakLengthException
+        else:
+            raise InvalidTweakLengthException
+
+        # Split data into substrings, FF3 steps 1 & 2
+        n = len(sData)
+        u = sData.getMid(iMode=FFXCrypt.MODE_FF3)
+        v = n-u
+
+
+        A = sData[:u]
+        B = sData[u:]
+
+        # FF3 step 3
+        TL = bytearray(str(sTweak[:4]).encode())
+        TR = bytearray(str(sTweak[4:]).encode())
+
+        # Execute Feistel rounds, FF3 step 4
+        if(iDirection == FFXCrypt.FFX_ENCRYPT):
+            iStart = 0
+            iEnd = self._iRnds
+            iMult = 1
+        elif(iDirection == FFXCrypt.FFX_DECRYPT):
+            iStart = self._iRnds
+            iEnd = 0
+            iMult = -1
+
+        for i in range(iStart, iEnd):
+            # FF3 5.i
+            W = bytearray(b'')
+            if( i % 2 == 0):
+                m = u
+                W.extend(TR)
+            else:
+                m = v
+                W.extend(TL)
+
+            # FF3 5.ii
+            P = bytearray(b'')
+            sTmp = B.to_bytes()
+            sTmp.reverse()
+            strTmp = FFXString(sTmp, iRadix=self._iRadix, iBlockSize=self._iBlockSize)
+            P.extend(strTmp.to_bytes(iBlocksize=12))
+            for x in range(4):
+                bTmp = bytearray(W[x] ^ long_to_bytes(i, 4)[x])
+                P.extend(long_to_bytes(bTmp[0]))
+            P.reverse()
+
+            # FF3 5.iii
+            bKey = bytes(self._ffxKey.to_bytes(16))
+            ebcAES = AES.new(bKey, AES.MODE_ECB)
+            bTmp = ebcAES.encrypt(bytes(P))
+            Y = bytearray(bTmp)
+
+            # FF3 5.iv
+            Y.reverse()
+            y = FFXString(Y, iRadix=2).to_int()
+
+            # FF3 5.v
+            #sTmp = FFXString(A.to_bytes().reverse())
+            sTmp = A.to_bytes()
+            sTmp.reverse()
+            strTmp = FFXString(sTmp, iRadix=self._iRadix, iBlockSize=self._iBlockSize)
+            c = (strTmp.to_int() + iMult*y) % (self._iRadix ** m)
+
+            # FF3 5.vi
+            strTmp = str(FFXString(c, iRadix=self._iRadix, iBlockSize=self._iBlockSize))[::-1]
+
+            C = FFXString(strTmp[:m], iRadix=self._iRadix, iBlockSize=self._iBlockSize)
+
+            # FF3 5.vii
+            A = B
+
+            # FF3 5.viii
+            B = C
+
+        # FF3 5
+        sRetValue = str(A).rjust(u, '0') + str(B).rjust(v, '0')
+        return(sRetValue)
+
+
 class FFXCrypt(object):
     """
     Class that handles FFX cryptographic operations on FFX character strings
@@ -523,6 +670,8 @@ class FFXCrypt(object):
             self._objMode = FFXModeFF1(ffxKey, iRadix, iBlockSize)
         elif(iMode == self.MODE_FF2):
             self._objMode = FFXModeFF2(ffxKey, iRadix, iBlockSize)
+        elif(iMode == self.MODE_FF3):
+            self._objMode = FFXModeFF3(ffxKey, iRadix, iBlockSize)
         else:
             raise InvalidFFXModeException
 
@@ -565,7 +714,9 @@ sKey = FFXString(bKey)
 
 iRadix = 10
 sData = FFXString('0123456789', iRadix=iRadix)
-sTweak = FFXString('9876543210', iRadix=iRadix)
+#sData = FFXString('0143456687', iRadix=iRadix)
+#sTweak = FFXString('9876543210', iRadix=iRadix)
+sTweak = FFXString('98765432', iRadix=iRadix)
 #sTweak = None
 
 """
@@ -576,10 +727,10 @@ lVal = bytes_to_long(bVal)
 print(lVal)
 """
 
-sCrypt = FFXCrypt(sKey, iMode=FFXCrypt.MODE_FF2).encrypt(sData, sTweak)
+sCrypt = FFXCrypt(sKey, iMode=FFXCrypt.MODE_FF3).encrypt(sData, sTweak)
 print('sCrypt = ' + sCrypt)
 
-sPlain = FFXCrypt(sKey, iMode=FFXCrypt.MODE_FF2).decrypt(sData, sTweak)
+sPlain = FFXCrypt(sKey, iMode=FFXCrypt.MODE_FF3).decrypt(sData, sTweak)
 print('sPlain = ' + sPlain)
 
 
